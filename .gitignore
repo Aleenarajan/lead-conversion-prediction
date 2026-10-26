@@ -4,3 +4,7 @@ scored_open_leads.csv
 __pycache__/
 .venv/
 *.pyc
+
+.ipynb_checkpoints/
+.virtual_documents/
+Untitled*.ipynb
