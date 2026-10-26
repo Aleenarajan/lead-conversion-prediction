@@ -1,0 +1,6 @@
+Unified_Leads.csv
+scored_open_leads.csv
+*.joblib
+__pycache__/
+.venv/
+*.pyc
