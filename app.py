@@ -107,9 +107,66 @@ NUM_COLS = ["is_refurbished", "is_no_stipend", "created_hour", "created_dow",
 # Data + model loading (cached so the app only trains once per session)
 # --------------------------------------------------------------------------- #
 
-@st.cache_data(show_spinner="Loading and cleaning the leads data...")
-def load_data(path: str):
-    df = pd.read_csv(path)
+def make_demo_data(n: int = 8000, seed: int = 7) -> pd.DataFrame:
+    """Synthetic leads with the same columns as Unified_Leads.csv.
+    Nothing here comes from Knovista: names, contacts and outcomes are all made up,
+    so the public demo never exposes real lead details."""
+    rng = np.random.default_rng(seed)
+    campaigns = {
+        "Python Campaign": 0.4, "Python No Stipend Campaign": -0.2,
+        "Data Analytics Campaign": 0.6, "Data Analytics Refurbished Campaign": -0.4,
+        "Business Accounting Campaign": 0.3, "Digital Marketing Campaign": 0.0,
+        "Digital Marketing No Stipend Campaign": -0.5, "UI/UX Campaign": -0.1,
+        "PHP Campaign": -0.3, "SAP Campaign": 0.2,
+    }
+    sources = {  # (source_type, source_name): effect
+        ("INSTAGRAM", "INSTAGRAM"): 0.2, ("FACEBOOK_ADS", "FACEBOOK_ADS"): 0.0,
+        ("FILE_UPLOAD", "bulk_upload_1.xlsx"): -0.5, ("FILE_UPLOAD", "full leads.csv"): -0.3,
+        ("MOVE_LEAD", "MOVE_LEAD"): 0.1, ("WALK_IN_LEAD", "WALK_IN_LEAD"): 1.2,
+    }
+    reps = {"Rep A": 0.5, "Rep B": 0.2, "Rep C": 0.0, "Rep D": -0.2, "Rep E": -0.4, "Rep F": 0.1}
+
+    camp_names = rng.choice(list(campaigns), n)
+    src_keys = list(sources)
+    src_idx = rng.choice(len(src_keys), n, p=[0.30, 0.30, 0.15, 0.10, 0.10, 0.05])
+    rep_names = rng.choice(list(reps), n)
+
+    start = pd.Timestamp("2025-06-01")
+    created = start + pd.to_timedelta(rng.integers(0, 250 * 24 * 60, n), unit="m")
+    called = rng.random(n) > 0.25
+    hours = rng.exponential(10, n)
+
+    z = (-1.7
+         + 2.2 * np.array([campaigns[c] for c in camp_names])
+         + 2.2 * np.array([sources[src_keys[i]] for i in src_idx])
+         + 2.2 * np.array([reps[r] for r in rep_names])
+         - 0.06 * np.where(called, hours, 40)
+         - 1.0 * (~called))
+    converted = rng.random(n) < 1 / (1 + np.exp(-z))
+
+    resolved = rng.random(n) < 0.65
+    stage = np.where(resolved, np.where(converted, "CONVERTED", "LOST"),
+                     rng.choice(["Prospect", "Follow Up Required"], n))
+    fmt = lambda s: s.dt.strftime(DT_FMT)
+    created_s = pd.Series(created)
+    first_call = pd.Series(created + pd.to_timedelta(hours, unit="h")).where(called)
+
+    return pd.DataFrame({
+        "Name": [f"Demo Lead {i:05d}" for i in range(n)],
+        "contact_number": [f"DEMO-{i:05d}" for i in range(n)],
+        "Contact_email": [f"demo{i:05d}@example.invalid" for i in range(n)],
+        "campaign_name": camp_names,
+        "source_type": [src_keys[i][0] for i in src_idx],
+        "source_name": [src_keys[i][1] for i in src_idx],
+        "assigned_to": rep_names,
+        "creation_date": fmt(created_s),
+        "first_call_attempt": fmt(first_call).where(called),
+        "lead_stage": stage,
+    })
+
+
+def prepare_data(df: pd.DataFrame):
+    df = df.copy()
     for c in df.columns:
         if df[c].dtype == "object":
             df[c] = df[c].str.strip()
@@ -120,6 +177,16 @@ def load_data(path: str):
     labeled["converted"] = (labeled["lead_stage"] == "CONVERTED").astype(int)
     open_leads = df[~df["lead_stage"].isin(["CONVERTED", "LOST"])].copy()
     return df, labeled, open_leads
+
+
+@st.cache_data(show_spinner="Loading and cleaning the leads data...")
+def load_data(path):
+    return prepare_data(pd.read_csv(path))
+
+
+@st.cache_data(show_spinner="Generating synthetic demo leads...")
+def load_demo():
+    return prepare_data(make_demo_data())
 
 
 @st.cache_resource(show_spinner="Training the model (Random Forest, this takes a few seconds)...")
@@ -172,18 +239,27 @@ st.sidebar.caption("Knovista live project — Machine Learning classification")
 data_file = st.sidebar.file_uploader("Unified_Leads.csv", type="csv")
 default_path = "Unified_Leads.csv"
 
+DEMO_MODE = False
 if data_file is not None:
     df, labeled, open_leads = load_data(data_file)
 else:
     try:
         df, labeled, open_leads = load_data(default_path)
     except FileNotFoundError:
-        st.warning("Upload `Unified_Leads.csv` in the sidebar to get started.")
-        st.stop()
+        DEMO_MODE = True
+        df, labeled, open_leads = load_demo()
+        st.sidebar.info("Demo mode: using synthetic leads. Upload the real CSV above to use real data.")
 
 model, metrics, roc_data, cm = train_model(labeled)
 
 page = st.sidebar.radio("Go to", ["Overview", "Predict a lead", "Model performance", "Score open leads"])
+
+if DEMO_MODE:
+    st.warning(
+        "**Demo mode:** this app is running on **synthetic, made-up leads** so no real "
+        "lead details are public. The numbers below are not Knovista's real results. "
+        "The real analysis is in the project notebook on GitHub."
+    )
 
 # --------------------------------------------------------------------------- #
 # Page: Overview
@@ -221,12 +297,13 @@ if page == "Overview":
     plt.xticks(rotation=30, ha="right")
     st.pyplot(fig2)
 
-    st.info(
-        "⚠️ **Honest caveat:** a robustness check (time-based split, and removing the "
-        "top-converting salesperson) showed most of this signal comes from one salesperson/"
-        "campaign combination early in the data, not generalizable lead attributes. "
-        "See the project notebook for the full analysis."
-    )
+    if not DEMO_MODE:
+        st.info(
+            "⚠️ **Honest caveat:** a robustness check (time-based split, and removing the "
+            "top-converting salesperson) showed most of this signal comes from one salesperson/"
+            "campaign combination early in the data, not generalizable lead attributes. "
+            "See the project notebook for the full analysis."
+        )
 
 # --------------------------------------------------------------------------- #
 # Page: Predict a lead
